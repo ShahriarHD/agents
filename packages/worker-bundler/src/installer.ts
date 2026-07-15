@@ -416,124 +416,120 @@ export async function fetchPackageFiles(
     );
   }
 
-  // Get the tarball as array buffer
-  const buffer = await response.arrayBuffer();
+  if (!response.body) {
+    throw new Error(
+      `Tarball response for ${name}@${metadata.version} had no body (${tarballUrl})`
+    );
+  }
 
   // Extract the tarball (npm tarballs are gzipped tar files)
-  return extractTarball(new Uint8Array(buffer), retain);
+  return extractTarball(response.body, retain);
 }
 
 /**
- * Extract files from a gzipped tarball.
+ * Extract text files from a gzipped tarball stream.
  *
- * npm packages are distributed as .tgz files (gzipped tar).
- * The contents are in a "package/" directory.
- */
-async function extractTarball(
-  data: Uint8Array,
-  retain: RetainMode
-): Promise<Record<string, string>> {
-  // Decompress gzip
-  const decompressed = await decompress(data);
-
-  // Parse tar
-  return parseTar(decompressed, retain);
-}
-
-/**
- * Decompress gzip data using DecompressionStream.
- */
-async function decompress(data: Uint8Array): Promise<Uint8Array> {
-  // Use DecompressionStream (available in Workers and modern browsers)
-  const ds = new DecompressionStream("gzip");
-  const writer = ds.writable.getWriter();
-  const reader = ds.readable.getReader();
-
-  // Write compressed data
-  writer.write(data as Uint8Array<ArrayBuffer>).catch(() => {});
-  writer.close().catch(() => {});
-
-  // Read decompressed data
-  const chunks: Uint8Array[] = [];
-  let totalLength = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    totalLength += value.length;
-  }
-
-  // Concatenate chunks
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  return result;
-}
-
-/**
- * Parse a tar archive and extract text files.
+ * npm packages are distributed as .tgz files (gzipped tar); the contents are
+ * in a "package/" directory. The response body is piped through gzip
+ * decompression and tar records are consumed as they arrive, so at no point
+ * do the compressed tarball or the fully decompressed archive exist as
+ * whole buffers — the working set is one decompression chunk plus whatever
+ * spans a chunk boundary (at most one tar header + one file's content).
  *
  * TAR format:
  * - 512-byte header blocks
  * - File content (padded to 512 bytes)
  * - Two empty blocks at the end
  */
-function parseTar(
-  data: Uint8Array,
+async function extractTarball(
+  body: ReadableStream<Uint8Array>,
   retain: RetainMode
-): Record<string, string> {
+): Promise<Record<string, string>> {
   const files: Record<string, string> = {};
   const textDecoder = new TextDecoder();
-  let offset = 0;
+  // Cast: workers-types declares DecompressionStream's writable side as
+  // BufferSource, which pipeThrough's ReadableWritablePair can't unify with
+  // the Uint8Array response body. The runtime accepts it fine.
+  const reader = (
+    body.pipeThrough(
+      new DecompressionStream("gzip") as unknown as TransformStream<
+        Uint8Array,
+        Uint8Array
+      >
+    ) as ReadableStream<Uint8Array>
+  ).getReader();
 
-  while (offset < data.length - 512) {
-    // Read header
-    const header = data.slice(offset, offset + 512);
+  // Decompressed bytes not yet consumed as complete tar records.
+  let pending: Uint8Array = new Uint8Array(0);
+  let streamDone = false;
+  let archiveEnded = false;
 
-    // Check for empty block (end of archive)
-    if (header.every((b) => b === 0)) {
-      break;
+  while (!streamDone && !archiveEnded) {
+    const { done, value } = await reader.read();
+    if (done) {
+      streamDone = true;
+    } else if (pending.length === 0) {
+      pending = value;
+    } else {
+      const merged = new Uint8Array(pending.length + value.length);
+      merged.set(pending);
+      merged.set(value, pending.length);
+      pending = merged;
     }
 
-    // Parse header fields
-    const name = readString(header, 0, 100);
-    const sizeStr = readString(header, 124, 12);
-    const typeFlag = header[156];
+    // Consume as many complete header+content records as are buffered.
+    let offset = 0;
+    while (pending.length - offset >= 512) {
+      const header = pending.subarray(offset, offset + 512);
 
-    // Parse size (octal)
-    const size = parseInt(sizeStr.trim(), 8) || 0;
-
-    // Move past header
-    offset += 512;
-
-    // Only process regular files (type '0' or '\0')
-    if ((typeFlag === 48 || typeFlag === 0) && size > 0) {
-      // Read file content
-      const content = data.slice(offset, offset + size);
-
-      // Remove "package/" prefix from npm tarballs
-      let filePath = name;
-      if (filePath.startsWith("package/")) {
-        filePath = filePath.slice(8);
+      // Check for empty block (end of archive)
+      if (header.every((b) => b === 0)) {
+        archiveEnded = true;
+        break;
       }
 
-      // Only include text files (skip binary files) that the retain mode keeps
-      if (isTextFile(filePath) && shouldRetainFile(filePath, retain)) {
-        try {
-          files[filePath] = textDecoder.decode(content);
-        } catch {
-          // Skip files that can't be decoded as text
+      // Parse header fields
+      const sizeStr = readString(header, 124, 12);
+      const typeFlag = header[156];
+
+      // Parse size (octal)
+      const size = parseInt(sizeStr.trim(), 8) || 0;
+      const paddedSize = Math.ceil(size / 512) * 512;
+
+      // Wait for the full record (content is padded to 512 bytes)
+      if (pending.length - offset < 512 + paddedSize) {
+        break;
+      }
+
+      // Only process regular files (type '0' or '\0')
+      if ((typeFlag === 48 || typeFlag === 0) && size > 0) {
+        const name = readString(header, 0, 100);
+
+        // Remove "package/" prefix from npm tarballs
+        let filePath = name;
+        if (filePath.startsWith("package/")) {
+          filePath = filePath.slice(8);
+        }
+
+        // Only include text files (skip binary files) that the retain mode keeps
+        if (isTextFile(filePath) && shouldRetainFile(filePath, retain)) {
+          const content = pending.subarray(offset + 512, offset + 512 + size);
+          try {
+            files[filePath] = textDecoder.decode(content);
+          } catch {
+            // Skip files that can't be decoded as text
+          }
         }
       }
-    }
 
-    // Move to next block (content is padded to 512 bytes)
-    offset += Math.ceil(size / 512) * 512;
+      offset += 512 + paddedSize;
+    }
+    pending = pending.subarray(offset);
+  }
+
+  if (archiveEnded) {
+    // Release the stream without reading the trailing padding.
+    reader.cancel().catch(() => {});
   }
 
   return files;
@@ -547,9 +543,9 @@ function readString(
   offset: number,
   length: number
 ): string {
-  const bytes = buffer.slice(offset, offset + length);
+  const bytes = buffer.subarray(offset, offset + length);
   const nullIndex = bytes.indexOf(0);
-  const relevantBytes = nullIndex >= 0 ? bytes.slice(0, nullIndex) : bytes;
+  const relevantBytes = nullIndex >= 0 ? bytes.subarray(0, nullIndex) : bytes;
   return new TextDecoder().decode(relevantBytes);
 }
 
