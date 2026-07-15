@@ -226,10 +226,11 @@ export async function createApp(
   // Install npm dependencies if needed
   const installWarnings: string[] = [];
   if (hasDependencies(fileSystem)) {
-    const installResult = await installDependencies(
-      fileSystem,
-      registry ? { registry } : {}
-    );
+    // Retain only bundle-loadable files — see the same call in createWorker.
+    const installResult = await installDependencies(fileSystem, {
+      ...(registry ? { registry } : {}),
+      retain: "bundle"
+    });
     installWarnings.push(...installResult.warnings);
   }
 
