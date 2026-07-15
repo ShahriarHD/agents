@@ -58,6 +58,25 @@ interface NpmPackageMetadata {
   versions: Record<string, PackageJson>;
 }
 
+/**
+ * Which files from each package tarball are retained in the filesystem.
+ *
+ * - `"all"` keeps every text file a package publishes, including TypeScript
+ *   declarations. Use this when the filesystem also feeds the TypeScript
+ *   language service (`createTypescriptLanguageService`), which type-checks
+ *   against `node_modules` `.d.ts` files.
+ * - `"bundle"` keeps only what a bundle pass can load: source/dist code and
+ *   importable assets. TypeScript declarations (`.d.ts`/`.d.mts`/`.d.cts`) and
+ *   published test files are dropped. This is what `createWorker` uses — on a
+ *   real-world dependency tree these files are a large fraction of the
+ *   unpacked bytes and retaining them as strings can push a Worker past its
+ *   isolate memory limit.
+ *
+ * Regardless of mode, files nothing in this package can ever read — source
+ * maps, docs (`.md`), licenses/changelogs — are never retained.
+ */
+export type RetainMode = "all" | "bundle";
+
 interface InstallOptions {
   /**
    * Include devDependencies (default: false)
@@ -68,6 +87,12 @@ interface InstallOptions {
    * Registry URL (default: https://registry.npmjs.org)
    */
   registry?: string;
+
+  /**
+   * Which files from each package tarball to retain (default: "all").
+   * See {@link RetainMode}.
+   */
+  retain?: RetainMode;
 }
 
 export interface InstallResult {
@@ -97,7 +122,7 @@ export async function installDependencies(
   fileSystem: FileSystem,
   options: InstallOptions = {}
 ): Promise<InstallResult> {
-  const { dev = false, registry = NPM_REGISTRY } = options;
+  const { dev = false, registry = NPM_REGISTRY, retain = "all" } = options;
 
   const result: InstallResult = {
     installed: [],
@@ -143,7 +168,8 @@ export async function installDependencies(
         fileSystem,
         installedPackages,
         inProgress,
-        registry
+        registry,
+        retain
       )
     )
   );
@@ -161,7 +187,8 @@ async function installPackage(
   fileSystem: FileSystem,
   installedPackages: Map<string, string>,
   inProgress: Map<string, Promise<void>>,
-  registry: string
+  registry: string,
+  retain: RetainMode
 ): Promise<void> {
   // Skip if already installed in this run
   if (installedPackages.has(name)) {
@@ -212,7 +239,11 @@ async function installPackage(
       result.installed.push(`${name}@${version}`);
 
       // Fetch and extract the package tarball
-      const packageFiles = await fetchPackageFiles(name, versionMetadata);
+      const packageFiles = await fetchPackageFiles(
+        name,
+        versionMetadata,
+        retain
+      );
 
       // Add files to node_modules
       for (const [filePath, content] of Object.entries(packageFiles)) {
@@ -230,7 +261,8 @@ async function installPackage(
             fileSystem,
             installedPackages,
             inProgress,
-            registry
+            registry,
+            retain
           )
         )
       );
@@ -320,7 +352,8 @@ function resolveVersion(
  */
 export async function fetchPackageFiles(
   name: string,
-  metadata: PackageJson
+  metadata: PackageJson,
+  retain: RetainMode = "all"
 ): Promise<Record<string, string>> {
   const tarballUrl = metadata.dist?.tarball;
   if (!tarballUrl) {
@@ -345,7 +378,7 @@ export async function fetchPackageFiles(
   const buffer = await response.arrayBuffer();
 
   // Extract the tarball (npm tarballs are gzipped tar files)
-  return extractTarball(new Uint8Array(buffer));
+  return extractTarball(new Uint8Array(buffer), retain);
 }
 
 /**
@@ -355,13 +388,14 @@ export async function fetchPackageFiles(
  * The contents are in a "package/" directory.
  */
 async function extractTarball(
-  data: Uint8Array
+  data: Uint8Array,
+  retain: RetainMode
 ): Promise<Record<string, string>> {
   // Decompress gzip
   const decompressed = await decompress(data);
 
   // Parse tar
-  return parseTar(decompressed);
+  return parseTar(decompressed, retain);
 }
 
 /**
@@ -407,7 +441,10 @@ async function decompress(data: Uint8Array): Promise<Uint8Array> {
  * - File content (padded to 512 bytes)
  * - Two empty blocks at the end
  */
-function parseTar(data: Uint8Array): Record<string, string> {
+function parseTar(
+  data: Uint8Array,
+  retain: RetainMode
+): Record<string, string> {
   const files: Record<string, string> = {};
   const textDecoder = new TextDecoder();
   let offset = 0;
@@ -443,8 +480,8 @@ function parseTar(data: Uint8Array): Record<string, string> {
         filePath = filePath.slice(8);
       }
 
-      // Only include text files (skip binary files)
-      if (isTextFile(filePath)) {
+      // Only include text files (skip binary files) that the retain mode keeps
+      if (isTextFile(filePath) && shouldRetainFile(filePath, retain)) {
         try {
           files[filePath] = textDecoder.decode(content);
         } catch {
@@ -523,6 +560,56 @@ function isTextFile(path: string): boolean {
   }
 
   return textExtensions.some((ext) => path.toLowerCase().endsWith(ext));
+}
+
+/**
+ * Decide whether an extracted tarball file is worth retaining in the
+ * filesystem, per {@link RetainMode}.
+ *
+ * Every retained file lives in memory as a JS string for the lifetime of the
+ * filesystem, so anything nothing in this package can read is dropped
+ * unconditionally: source maps (the bundler never emits external maps and
+ * strips references), docs, licenses and changelogs. `"bundle"` mode
+ * additionally drops TypeScript declarations and published test files, which
+ * only the TypeScript language service (not the bundler) can consume.
+ */
+function shouldRetainFile(path: string, retain: RetainMode): boolean {
+  const lower = path.toLowerCase();
+  const fileName = lower.split("/").pop() ?? "";
+
+  // Never useful: source maps, docs, package metadata prose.
+  if (
+    lower.endsWith(".map") ||
+    lower.endsWith(".md") ||
+    lower.endsWith(".markdown") ||
+    fileName.startsWith("license") ||
+    fileName.startsWith("licence") ||
+    fileName.startsWith("changelog") ||
+    fileName.startsWith("readme") ||
+    fileName.startsWith("notice") ||
+    fileName.startsWith("authors") ||
+    fileName === ".npmignore" ||
+    fileName === ".gitignore"
+  ) {
+    return false;
+  }
+
+  if (retain === "all") {
+    return true;
+  }
+
+  // "bundle": the bundler can never load declarations or test files. If a
+  // dropped file somehow IS imported, esbuild fails loudly with "File not
+  // found" rather than silently misbehaving — switch to retain: "all" then.
+  return !(
+    lower.endsWith(".d.ts") ||
+    lower.endsWith(".d.mts") ||
+    lower.endsWith(".d.cts") ||
+    lower.includes(".test.") ||
+    lower.includes(".spec.") ||
+    lower.includes("/__tests__/") ||
+    lower.includes("/__mocks__/")
+  );
 }
 
 /**

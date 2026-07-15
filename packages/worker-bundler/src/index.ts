@@ -66,7 +66,8 @@ export {
 export {
   installDependencies,
   hasDependencies,
-  type InstallResult
+  type InstallResult,
+  type RetainMode
 } from "./installer";
 
 /**
@@ -120,10 +121,13 @@ export async function createWorker(
   // Auto-install dependencies if package.json has dependencies
   const installWarnings: string[] = [];
   if (hasDependencies(fileSystem)) {
-    const installResult = await installDependencies(
-      fileSystem,
-      registry ? { registry } : {}
-    );
+    // Retain only bundle-loadable files: declarations, docs and test files
+    // would otherwise sit in memory as strings for the whole build and can
+    // push the isolate past its memory limit on large dependency trees.
+    const installResult = await installDependencies(fileSystem, {
+      ...(registry ? { registry } : {}),
+      retain: "bundle"
+    });
     installWarnings.push(...installResult.warnings);
   }
 
