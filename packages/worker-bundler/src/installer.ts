@@ -10,6 +10,29 @@ import type { FileSystem } from "./file-system";
 
 const NPM_REGISTRY = "https://registry.npmjs.org";
 const DEFAULT_TIMEOUT_MS = 30000; // 30 seconds
+const DEFAULT_INSTALL_CONCURRENCY = 8;
+
+/**
+ * Create a simple concurrency limiter: at most `max` tasks run at once,
+ * excess callers queue in FIFO order.
+ */
+function createLimiter(max: number): <T>(task: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiting: Array<() => void> = [];
+
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    if (active >= max) {
+      await new Promise<void>((resolve) => waiting.push(resolve));
+    }
+    active++;
+    try {
+      return await task();
+    } finally {
+      active--;
+      waiting.shift()?.();
+    }
+  };
+}
 
 /**
  * Fetch with a timeout.
@@ -93,6 +116,17 @@ interface InstallOptions {
    * See {@link RetainMode}.
    */
   retain?: RetainMode;
+
+  /**
+   * Maximum number of tarball downloads + extractions in flight at once
+   * (default: 8). Each in-flight install holds the compressed tarball, the
+   * fully gunzipped tar and the decoded file strings simultaneously, so
+   * unbounded parallelism makes peak memory proportional to the whole
+   * dependency tree rather than to the largest few packages. Metadata fetches
+   * and dependency-graph traversal are not limited — only the buffer-heavy
+   * fetch/extract stage.
+   */
+  concurrency?: number;
 }
 
 export interface InstallResult {
@@ -122,7 +156,12 @@ export async function installDependencies(
   fileSystem: FileSystem,
   options: InstallOptions = {}
 ): Promise<InstallResult> {
-  const { dev = false, registry = NPM_REGISTRY, retain = "all" } = options;
+  const {
+    dev = false,
+    registry = NPM_REGISTRY,
+    retain = "all",
+    concurrency = DEFAULT_INSTALL_CONCURRENCY
+  } = options;
 
   const result: InstallResult = {
     installed: [],
@@ -153,28 +192,43 @@ export async function installDependencies(
     return result; // No dependencies to install
   }
 
-  // Track installed packages to avoid duplicates
-  const installedPackages = new Map<string, string>(); // name -> version
-  // Track in-progress installations to avoid duplicate work
-  const inProgress = new Map<string, Promise<void>>();
+  const ctx: InstallContext = {
+    result,
+    fileSystem,
+    // Track installed packages to avoid duplicates
+    installedPackages: new Map(),
+    // Track in-progress installations to avoid duplicate work
+    inProgress: new Map(),
+    registry,
+    retain,
+    limitExtraction: createLimiter(concurrency)
+  };
 
   // Install all dependencies in parallel
   await Promise.all(
     Object.entries(depsToInstall).map(([name, versionRange]) =>
-      installPackage(
-        name,
-        versionRange,
-        result,
-        fileSystem,
-        installedPackages,
-        inProgress,
-        registry,
-        retain
-      )
+      installPackage(name, versionRange, ctx)
     )
   );
 
   return result;
+}
+
+/**
+ * Shared state for one `installDependencies` run, threaded through the
+ * recursive install. Kept as an object (rather than a long positional list)
+ * so new install-wide state can be added without churning every call site.
+ */
+interface InstallContext {
+  result: InstallResult;
+  fileSystem: FileSystem;
+  /** name -> resolved version (or "existing" for pre-warmed packages) */
+  installedPackages: Map<string, string>;
+  inProgress: Map<string, Promise<void>>;
+  registry: string;
+  retain: RetainMode;
+  /** Caps concurrent tarball fetch/extract work — see InstallOptions.concurrency. */
+  limitExtraction: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
 /**
@@ -183,13 +237,9 @@ export async function installDependencies(
 async function installPackage(
   name: string,
   versionRange: string,
-  result: InstallResult,
-  fileSystem: FileSystem,
-  installedPackages: Map<string, string>,
-  inProgress: Map<string, Promise<void>>,
-  registry: string,
-  retain: RetainMode
+  ctx: InstallContext
 ): Promise<void> {
+  const { result, fileSystem, installedPackages, inProgress, registry } = ctx;
   // Skip if already installed in this run
   if (installedPackages.has(name)) {
     return;
@@ -238,11 +288,12 @@ async function installPackage(
       installedPackages.set(name, version);
       result.installed.push(`${name}@${version}`);
 
-      // Fetch and extract the package tarball
-      const packageFiles = await fetchPackageFiles(
-        name,
-        versionMetadata,
-        retain
+      // Fetch and extract the package tarball. Limited so only a bounded
+      // number of tarballs and their decompressed buffers exist at once;
+      // the dependency recursion below stays outside the limiter, so this
+      // cannot deadlock however deep the tree is.
+      const packageFiles = await ctx.limitExtraction(() =>
+        fetchPackageFiles(name, versionMetadata, ctx.retain)
       );
 
       // Add files to node_modules
@@ -254,16 +305,7 @@ async function installPackage(
       const deps = versionMetadata.dependencies ?? {};
       await Promise.all(
         Object.entries(deps).map(([depName, depVersion]) =>
-          installPackage(
-            depName,
-            depVersion,
-            result,
-            fileSystem,
-            installedPackages,
-            inProgress,
-            registry,
-            retain
-          )
+          installPackage(depName, depVersion, ctx)
         )
       );
     } catch (error) {
